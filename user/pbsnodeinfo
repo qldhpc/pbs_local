@@ -1,0 +1,103 @@
+#!/bin/bash 
+
+usage_str="Usage: $(basename $0) [-v] [-f]"
+verbose=0
+showfree=0
+while getopts vf opt; do
+  case "$opt" in
+    v) verbose=1
+       ;;
+    f) showfree=1
+       ;;
+    \?) # unknown flag
+       echo >&2 "$usage_str"
+       exit 1
+       ;;
+  esac
+done
+# get rid of option params
+shift $((OPTIND-1))
+
+if [ $# -gt 0 ]; then
+  echo >&2 "$usage_str"
+fi
+
+/opt/pbs/default/bin/pbsnodes -a | /usr/bin/awk -v verbose=$verbose -v showfree=$showfree '
+
+# match based on what is on the line
+# NF is the number of fields, only the node name has one field.
+NF == 1 { vnode = $1; nodenames[vnode] = vnode }
+/state/ { state[vnode] = $3 }
+/resources_assigned.ncpus/ { assigned_ncpus[vnode] = $3 }
+/resources_available.ncpus/ { available_ncpus[vnode] = $3 }
+/resources_assigned.mem/ { assigned_mem[vnode] = $3
+              # Sometimes (like when qrun is used) PBS stores in mb or gb
+                if ($3 ~ /mb/ ) 
+                  assigned_mem[vnode] = $3*1024 "kb"
+                if ($3 ~ /gb/ ) 
+                  assigned_mem[vnode] = $3*1048576 "kb"
+              }
+/resources_available.mem/ { available_mem[vnode] = $3 }
+/resources_available.ngpus/ { available_ngpus[vnode] = $3 }
+/resources_assigned.ngpus/ { assigned_ngpus[vnode] = $3 }
+/resources_available.nmics/ { available_nmics[vnode] = $3 }
+/resources_available.cputype/ { cputype[vnode] = $3 }
+/resources_available.gputype/ { gputype[vnode] = $3 }
+/resources_available.qlist/ { qlist[vnode] = $3 }
+/Priority/ { priority[vnode] = $3 }
+/state/ { states[vnode] = $3 }
+/comment/ { sub(/^[ ]*comment = /, ""); comment[vnode] = $0 }
+/Mom/ { moms[vnode] = $3 }
+
+END {
+
+  # sort by index (nodename)
+  n = asorti(nodenames, sortednames)
+  
+  # loop though each node
+  for (i = 1; i <= n; i++) {
+     vnode = nodenames[sortednames[i]]
+     mem = available_mem[vnode] / 1024 / 1024
+     if (showfree == 0) {
+       nc = assigned_ncpus[vnode]
+       mm = assigned_mem[vnode] / 1024 / 1024
+       if ( available_ngpus[vnode] > 0 ) {
+         ng = assigned_ngpus[vnode]
+       }
+     } else {
+       nc = available_ncpus[vnode] - assigned_ncpus[vnode]
+       mm = (available_mem[vnode] - assigned_mem[vnode]) / 1024 / 1024
+       if ( available_ngpus[vnode] > 0 ) {
+         ng = available_ngpus[vnode] - assigned_ngpus[vnode]
+       }
+     }
+
+     # print out node info
+     if ( states[vnode] ~ /offline/ ) {
+       nstate = states[vnode] "(" comment[vnode] ")"
+       printf "%s : %18s -- / %2d cpus; --- / %3d GB", vnode, states[vnode], available_ncpus[vnode], mem
+       if ( available_ngpus[vnode] > 0 ) {
+         printf "; %5s -- / %d gpus", gputype[vnode], available_ngpus[vnode]
+       }
+       if ( available_nmics[vnode] > 0 ) {
+         printf "; %d mic", available_nmics[vnode]
+       }
+     } else {
+       nstate = states[vnode]
+       printf "%s : %18s %2d / %2d cpus; %3d / %3d GB", vnode, cputype[vnode], nc, available_ncpus[vnode], mm, mem
+       if ( available_ngpus[vnode] > 0 ) {
+         printf "; %5s %d / %d gpus", gputype[vnode], ng, available_ngpus[vnode]
+       }
+       if ( available_nmics[vnode] > 0 ) {
+         printf "; %d mic", available_nmics[vnode]
+       }
+     }
+     if ( verbose == 1 ) {
+       printf "\n          state=%s, order=%s, qlist=%s", nstate, priority[vnode], qlist[vnode]
+     }
+     printf "\n"
+  }
+  printf "\n"
+}
+'
+

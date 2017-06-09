@@ -1,0 +1,211 @@
+#!/bin/bash
+
+# qpeek: look at output of a running job
+#
+# Version 1.0 by Justin Lee <jm.lee@qut.edu.au>, 31/8/2015
+# Derived from the original Torque qpeek script by Ohio Supercomputer Center
+# Rewritten in Bash and adapted for Altair PBS
+
+
+usage_str="Usage: $(basename $0) [options] JOBID"
+read -r -d '' options_str <<EOF
+Options:
+   -c      Show all of the output file ("cat", default)
+   -h      Show only the beginning of the output file ("head")
+   -t      Show only the end of the output file ("tail")
+   -f      Show only the end of the file and keep listening ("tail -f")
+   -<num>  Show only <num> lines of output
+   +<num>  Show output from line <num>
+   -<num>f Show only the last <num> lines and keep listening ("tail -<num>f")
+   +<num>f Show from line <num> (0 for all) and keep listening ("tail +<num>f")
+   -e      Show the stderr file of the job
+   -o      Show the stdout file of the job
+   -?      Display help
+EOF
+
+# some defaults for PBS
+pbsserver="pbsserver"
+spool="/var/spool/PBS"
+pbsconf="/etc/pbs.conf"
+
+
+tool="";
+follow=""
+numlines=""
+suffix=""
+jobid=""
+
+if [ $# -lt 1 ]; then
+    echo >&2 "$usage_str"
+    echo >&2 "$options_str"
+    echo >&2 ""
+    exit 0
+fi
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -\?) # Display help
+            echo >&2 "$usage_str"
+            echo >&2 "$options_str"
+            echo >&2 ""
+            exit 0
+            ;;
+        -c) # Show all of the output file ("cat", default)
+            if [ "$tool" == "" ]; then
+                tool="cat"
+                shift
+            else
+                echo >&2 "Error: Only one of the -c -h -t options can be specified!"
+                exit 1
+            fi
+            ;;
+        -h) # Show only the beginning of the output file ("head")
+            if [ "$tool" == "" ]; then
+                tool="head"
+                shift
+            else
+                echo >&2 "Error: Only one of the -c -h -t options can be specified!"
+                exit 1
+            fi
+            ;;
+        -t) # Show only the end of the output file ("tail")
+            if [ "$tool" == "" ]; then
+                tool="tail"
+                shift
+            else
+                echo >&2 "Error: Only one of the -c -h -t options can be specified!"
+                exit 1
+            fi
+            ;;
+        -f) # Show only the end of the file and keep listening ("tail -f")
+            follow="-f"
+            shift
+            ;;
+        -e) # Show the stderr file of the job
+            if [ "$suffix" != "OU" ]; then
+                suffix="ER"
+                shift
+            else
+                echo >&2 "Error: Only one of the -o and -e options can be specified!"
+                exit 1
+            fi
+            ;;
+        -o) # Show the stdout file of the job 
+            if [ "$suffix" != "ER" ]; then
+                suffix="OU"
+                shift
+            else
+                echo >&2 "Error: Only one of the -o and -e options can be specified!"
+                exit 1
+            fi
+            ;;
+        -[0-9]*|+[0-9]*) # Show only <num> lines of output
+            if [ "$numlines" == "" ]; then
+                # if <num> suffixed with 'f', set follow and strip 'f' from <num>
+                [ "${1:(-1)}" == "f" ] && follow="-f"
+                numlines="${1%%f*}"
+                shift
+            else
+                echo >&2 "Error: Only one (+|-)<num>[f] parameter can be specified!"
+                exit 1
+            fi
+            ;;
+         [0-9]*) # JOBID
+            if [ "$jobid" == "" ]; then
+                jobid="${1%%.pbs*}" # strip out any .pbs* suffix if given
+                shift
+            else
+                echo >&2 "Error: Only one JOBID parameter can be specified!"
+                exit 1
+            fi
+            ;;
+         *) # unknown option or argument
+            echo >&2 "Error: unknown option '$1'!"
+            echo >&2 "$usage_str"
+            echo >&2 "$options_str"
+            echo >&2 ""
+            exit 1
+            ;;
+    esac
+done
+
+if [ -z "$jobid" ]; then
+    # nothing to do
+    echo >&2 "Error: JOBID parameter wasn't specified!"
+    exit 1
+fi
+
+# default is to look at job's output file
+if [ "$suffix" == "" ]; then
+    suffix="OU"
+fi
+
+if [ "$tool" == "" ]; then
+    # default to 'cat' if no options provided
+    if [ -z "$follow" ] && [ -z "$numlines" ]; then
+        tool="cat"
+    else
+        # if '-f' or num lines specified, then use tail by default
+        tool="tail"
+    fi
+fi
+
+if [ -n "$follow" ]; then
+    if [ "$tool" == "head" ] || [ "$tool" == "cat" ]; then 
+        echo >&2 "Error: -f, +<num>f and -<num>f options can only be used with tail!"
+        exit 1
+    else # tool=tail
+        if [ -z "$numlines" ]; then
+            tool="tail -f"
+        else
+            numlines="${numlines}f"
+        fi
+    fi
+fi
+
+if [ -n "$numlines" ]; then 
+    if [ "$tool" == "head" ]; then
+        tool="head -n $numlines"
+    elif [ "$tool" == "tail" ]; then
+        tool="tail $numlines"
+    else
+        echo >&2 "Error: +<num> and -<num> options can only be used with head or tail!"
+        exit 1
+    fi
+fi
+
+
+# get the name of the node where the job is running
+node=$(qstat -f "$jobid" 2>/dev/null | awk '
+    /exec_host/ {
+        host = $3
+        idx=index($3,"/") 
+        if (idx>0) {
+            host=substr($3, 1, idx-1)
+        }
+        print host
+    }
+')
+
+if [ -z "$node" ]; then
+    # job isn't running
+    echo >&2 "Job $jobid is not running!"
+    exit 0
+fi
+
+# if it exists, the node config overides PBS defaults
+node_conf=$(ssh -n $node cat $pbsconf)
+if [ -n "$node_conf" ]; then
+    pbs_home=$(echo $node_conf | tr " " "\n" | awk -F '=' '/PBS_HOME/ { print $2 }')
+    pbs_server=$(echo $node_conf | tr " " "\n" | awk -F '=' '/PBS_SERVER/ { print $2 }')
+    [ -n "$pbs_home" ] && spool="$pbs_home"
+    [ -n "$pbs_server" ] && pbsserver="$pbs_server"
+fi
+
+jobname="$jobid.$pbsserver"
+command="$tool $spool/spool/$jobname.$suffix"
+
+# now excute the command on the node to look at job's outputs
+#echo >&2 "executing command: ssh -n $node $command"
+ssh -n $node $command
+

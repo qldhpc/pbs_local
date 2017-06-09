@@ -1,0 +1,18 @@
+#!/bin/bash
+#
+#  Script to match full name with username from /etc/passwd file.
+#  The ouput is nicely formatted with no phone numbers.    
+#  A call to the tidyname binary ensures hyphens, mc, MC, Mc, o'
+#  and O' are all handled appropriately.
+#
+#  (C) HPC & Research Support Group, QUT, Australia.
+# 
+if [ $# -eq 1 ]; then
+name=$(getent passwd $1 | awk -F":" '{print $5}' )
+echo $name
+ret_code=$?
+else
+echo "Usage: pinky userid"
+ret_code=2 
+fi
+exit $ret_code 

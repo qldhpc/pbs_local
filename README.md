@@ -1,2 +1,3 @@
 # pbs_local
-Local site PBS scripts
+
+A repository of local site PBS scripts.

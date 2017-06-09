@@ -1,0 +1,286 @@
+#!/bin/bash
+
+#
+# Count the number of jobs each user is running
+#
+#
+# (C) HPC & Research Support Group, QUT, Australia.
+#
+
+# Prevent users from stopping this script mid-way
+# i.e., trap SIGINT, SIGQUIT, SIGTERM & SIGTSTP
+
+#trap '' 2 3 15 24
+
+# we determine which variant of qusers to run
+# based on the name and path of the symlink this was run from
+qusersbase=$(basename $0)
+qusersdir=$(dirname $0)
+
+# default qusers options
+showforusers=0
+showname=1
+showmem=0
+showtime=0
+
+case "$qusersbase" in
+    qusers-all) # can run with command line options if running directly
+        # process command line options
+        while getopts mn opt; do
+            case "$opt" in
+                m) # qusers-more
+                    showforusers=0
+                    showname=1
+                    showmem=1
+                    showtime=1
+                    break
+                    ;;  
+                n) # quser-nouser
+                    showforusers=1
+                    showname=0
+                    showmem=0
+                    showtime=0
+                    break
+                    ;;  
+                \?) # unknown flag
+                    echo >&2 "Usage: qusers-all [-m | -n]"
+                    exit 1
+                    ;;  
+            esac
+        done
+        # get rid of option params
+        shift $((OPTIND-1))
+        ;;
+    qusers-nouser)
+        showforusers=1
+        showname=0
+        showmem=0
+        showtime=0
+        ;;
+    qusers-more)
+        showforusers=0
+        showname=1
+        showmem=1
+        showtime=1
+        ;;
+    qusers)
+        # qusers in /usr/local/bin is qusers-nouser
+        if [ "$qusersdir" = "/usr/local/bin" ]; then
+            showforusers=1
+            showname=0
+            showmem=0
+            showtime=0
+        fi
+        # otherwise use defaults
+        ;;
+    *) # don't know this one
+        echo >&2 "qusers-all: Error $qusersbase is an unknown option!"
+        echo >&2 "qusers-all should be run via a symlink named qusers, qusers-nouser or qusers-more"
+        exit 1
+        ;;  
+esac
+
+printf "\n"
+date
+
+qstat -Tts1 | \
+awk -v showname=$showname -v showforusers=$showforusers -v showmem=$showmem -v showtime=$showtime '
+    BEGIN { }
+
+    # skip the header lines of qstat
+    NR>6 {
+        # retrieve the userid, number of cpus, mem, time and state of the job
+        user=$2
+        nodes=$6
+        cpu=$7
+        cores = cpu / nodes
+        mem=$8
+        userjob=$2 "-" $7 "-" $8
+        reqtime=$9
+        state=$10
+        estart=$11
+        comment=$12 " " $13
+
+        # convert memory requested to GB
+        if ( mem ~ /kb/ ) {
+            mem = mem/1024 "mb"
+        }
+        if ( mem ~ /mb/ ) {
+            mem = mem/1024 "gb"
+        }
+
+        split(reqtime,temp,":")
+        #reqhours = temp[1] + temp[2]/60
+        reqhours = temp[1]
+
+        # increment the totals for this user in the hash map
+        userJobs[user] += 1
+        if ( state ~ /R/ ) {
+            userRun[user] += 1
+            userCpus[user] += cpu
+            userMem[user] += mem
+            userTime[user] += reqhours
+            userCpuTime[user] += cpu * reqhours
+            userJobsR[userjob] += 1
+            # if any jobs by this user with same cpu, mem is running, remove warnings for this job
+            if ( userJobsW[userjob] > 0 ) {
+                userWarn[user] -= userJobsW[userjob]
+                userJobsW[userjob] = 0
+            }
+        } else if ( state ~ /Q/ ) {
+            userQueued[user] += 1
+            userCpuQueued[user] += cpu
+            userMemQueued[user] += mem
+            userTimeQueued[user] += reqhours
+            userCpuTimeQueued[user] += cpu * reqhours
+            # if job has no estimated start time and a "Not Running: ..." comment
+            # and additionally no jobs by this user with the same cpu, mem are running
+            # then add it to the warnings
+            if ( estart ~ /--/ && comment ~ /Not Running:/ && userJobsR[userjob] < 1 ) {
+                userWarn[user] += 1
+                userJobsW[userjob] += 1
+            } else if ( (mem > 252 && mem <= 1009) || (cores > 24 && cores <= 32) ) {
+                # this job may only be runnable on big memory node cl2n001
+                userBigNode[user] += 1
+            }
+        } else {
+            userOther[user] += 1
+        }
+    }
+
+    # print this out at the end of the file
+    END {
+
+        # which host an I called from?
+        "hostname" |getline hostname
+        numusers = length(userJobs)
+
+        # header
+        printf "There are %i users with jobs on:  %s\n\n", numusers, hostname
+        if ( showmem > 0 ) {
+            header1 = "           |              JOBS                    |    CPUs     |  Memory(GB) |"
+            header2 = " Username  | #total #run #queue #other #bigM #warn| #run #queue | #run #queue |"
+            header3 = "==============================================================================="
+        } else {
+            header1 = "           |              JOBS              |    CPUs     |"
+            header2 = " Username  | #total #run #queue #other #warn| #run #queue |"
+            header3 = "==========================================================="
+        }
+        if ( showtime > 0 ) {
+            header1 = sprintf("%s    Time (hr)  |", header1)
+            header2 = sprintf("%s   #run #queue |", header2)
+            header3 = sprintf("%s================", header3)
+        }
+        # last field, if anything, is either the real name, or a comment, not both
+        if ( showname > 0 ) {
+            header2 = sprintf("%s Real Name", header2)
+            header3 = sprintf("%s===================", header3)
+        } else if ( showforusers > 0 ) {
+            header2 = sprintf("%s   Comments", header2)
+            header3 = sprintf("%s===================", header3)
+        }
+        printf "%s\n%s\n%s\n", header1, header2, header3
+
+
+        # sort
+        n = asorti(userJobs, usersSorted)
+
+        # loop though each user
+        for (i = 1; i <= n; i++) {
+            user = usersSorted[i]
+            if ( showname == 1 ) {
+                pinky_cmd = "/pkg/hpc/scripts/pinky " user
+                pinky_cmd |getline real_name
+            } else {
+                real_name==""
+            }
+            warn = "    "
+            comment = ""
+            if ( userWarn[user] > 0 ) {
+                warn = sprintf("%4i", userWarn[user])
+                comment = sprintf("%i jobs possibly may not run", userWarn[user])
+            }
+            bign = "    "
+            if ( userBigNode[user] > 0 ) {
+                bign = sprintf("%4i", userBigNode[user])
+            }
+            other = "    "
+            if ( userOther[user] > 0 ) {
+                other = sprintf("%4i", userOther[user])
+            }
+            queued = "    "
+            cpuQueued = "     "
+            memQueued = "     "
+            timeQueued = "      "
+            if ( userQueued[user] > 0 ) {
+                queued = sprintf("%4i", userQueued[user])
+                cpuQueued = sprintf("%5i", userCpuQueued[user])
+                memQueued = sprintf("%5i", userMemQueued[user])
+                timeQueued = sprintf("%6i", userTimeQueued[user])
+            }
+
+            userline = sprintf("%10s |  %4i  %4i  %s  %s", user, userJobs[user], userRun[user], queued, other)
+            if ( showmem > 0 ) {
+                userline = sprintf("%s  %s", userline, bign)
+            }
+            userline = sprintf("%s  %s  | %4i  %s |", userline, warn, userCpus[user], cpuQueued)
+            if ( showmem > 0 ) {
+                userline = sprintf("%s %5i %s |", userline, userMem[user], memQueued)
+            }
+            if ( showtime > 0 ) {
+                userline = sprintf("%s %6i %s |", userline, userTime[user], timeQueued)
+            }
+            # last field, if anything, is either the real name, or a comment, not both
+            if ( showname > 0 ) {
+                userline = sprintf("%s %s", userline, real_name)
+            } else if ( showforusers > 0 ) {
+                userline = sprintf("%s %s", userline, comment)
+            }
+            printf "%s\n", userline
+
+            # calculate totals
+            tjobs += userJobs[user]
+            trun  += userRun[user]
+            tcpus += userCpus[user]
+            tcpuQ += userCpuQueued[user]
+            tqued += userQueued[user]
+            tothr += userOther[user]
+            twarn += userWarn[user]
+            tbign += userBigNode[user]
+            tmem  += userMem[user]
+            tmemQ += userMemQueued[user]
+            ttime += userTime[user]
+            ttimeQ += userTimeQueued[user]
+            cpuhoursQ += userCpuTimeQueued[user]
+        }
+
+        # footer = totals
+        if ( showmem > 0 ) {
+            footerl = "==============================================================================="
+            footert = sprintf("Totals     | %5i %5i %5i %5i  %4i  %4i  | %4i  %5i | %5i %5i |", tjobs, trun, tqued, tothr, tbign, twarn, tcpus, tcpuQ, tmem, tmemQ)
+        } else {
+            footerl = "==========================================================="
+            footert = sprintf("Totals     | %5i %5i %5i %5i  %4i  | %4i  %5i |", tjobs, trun, tqued, tothr, twarn, tcpus, tcpuQ)
+        }
+        if ( showtime > 0 ) {
+            footerl = sprintf("%s================", footerl)
+            footert = sprintf("%s %6i %6i |", footert, ttime, ttimeQ)
+        }
+        # last field, if anything, is either the real name, or a comment, not both
+        if ( showname > 0 ) {
+            footerl = sprintf("%s===================", footerl)
+        } else if ( showforusers > 0 ) {
+            footerl = sprintf("%s===================", footerl)
+        }
+        printf "%s\n%s\n%s\n", footerl, footert, footerl
+
+        if ( showforusers > 0 ) {
+            printf "For HPC enquires and assistance contact HPC Support on hpc-support@qut.edu.au\n\n"
+        } else {
+            printf " Estimated time to empty queue = %i hours or %0.1f days\n", cpuhoursQ / tcpus, cpuhoursQ / tcpus / 24
+            printf " Note: for information on jobs in the warn category: qstat -Ttis -u <username>\n\n"
+        }
+
+    }'
+
+
